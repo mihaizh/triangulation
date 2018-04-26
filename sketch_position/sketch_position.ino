@@ -1,13 +1,16 @@
-#include <L3G4200D.h>
 #include <Wire.h>
+#include <I2Cdev.h>
+#include <MPU6050_6Axis_MotionApps20.h>
 #include <math.h>
+#include <stdint.h>
+
+#define _DEBUG_MSG
 
 const float CTG_MAX = 100000000.f;
 const float CTG_MIN = -CTG_MAX;
 const float DEG2RAD = PI / 180.f;
+const float RAD2DEG = 180.f / PI;
 const float EPSILON = 1e-6;
-
-const String comma(",");
 
 inline float minmax(float minimum, float value, float maximum)
 {
@@ -19,55 +22,52 @@ inline float ctg(float value)
     return 1.f / tan(value);
 }
 
-inline void doOneStep(byte stepPin, short motorDelay, unsigned long& lastCommandTime, short& stepVal)
-{
-    unsigned long pt = micros() - lastCommandTime;
-    if (pt < motorDelay)
-    {
-        delayMicroseconds(motorDelay - pt);
-    }
-    
-    digitalWrite(stepPin, HIGH);
-    delayMicroseconds(motorDelay);
-    digitalWrite(stepPin, LOW);
-    //delayMicroseconds(motorDelay);
-
-    ++stepVal;
-    lastCommandTime = micros();
-}
-
 struct point
 {
-    int x;
-    int y;
+    int16_t x;
+    int16_t y;
 };
 
-const byte MAX_BEACONS = 3;
-const point beaconsLoc[MAX_BEACONS] = {
+const byte MAX_BEACONS = 3;             ///< beacons on scene
+const point beaconsLoc[MAX_BEACONS] = { ///< beacons locations
     { 60, 175 },
     { 180, 0 },
     { 0, 0 }
 };
 
-const byte stepPin = 3; ///< pin number for step
-const byte dirPin = 4;  ///< pin number for direction
-
-const short minDelayMotor = 600;   ///< minimum delay for stepper
-const short accMotor = 2;           ///< motor acceleration
+const byte stepPin = 4; ///< pin number for step
+const byte dirPin = 5;  ///< pin number for direction
 
 const byte laserInterruptPin = 2;   ///< pin number for laser interrupt
+const byte mpuInterruptPin = 3;     ///< pin number for mpu interrupt
 
-short motorDelay = 3500;    ///< motor speed (lower is faster)
-short stepVal = 0;          ///< current step of motor
+int16_t stepVal = 0;          ///< current step of motor
+
+const int16_t freqHigh = 877; ///< ~3.5ms
+const int16_t freqLow = 150;  ///< ~0.6ms
 
 const byte MAX_ANGLES = 3;                      ///< maximum measureable angles
 float angles[MAX_ANGLES] = { 0.F, 0.F, 0.F };   ///< measured angles
 byte anglesCount = 0;                           ///< number of measured angles
 
-L3G4200D gyro;
-unsigned long lastCycleTime = 0u; ///< last time angle was measured
-float yaw = 0.f; ///< current measured yaw
+MPU6050 mpu;
 
+bool dmpReady = false;  ///< set true if DMP init was successful
+uint8_t mpuIntStatus;   ///< holds actual interrupt status byte from MPU
+uint8_t devStatus;      ///< return status after each device operation (0 = success, !0 = error)
+uint16_t packetSize;    ///< expected DMP packet size (default is 42 bytes)
+uint16_t fifoCount;     ///< count of all bytes currently in FIFO
+uint8_t fifoBuffer[64]; ///< FIFO storage buffer
+float ypr[3];           ///< [yaw, pitch, roll]
+Quaternion q;           // [w, x, y, z]         quaternion container
+VectorFloat gravity;    // [x, y, z]            gravity vector
+int16_t yaw = 0;
+
+float x = 0.f;
+float y = 0.f;
+
+// Estimates robot position based on measured angles to each beacon
+// and beacon locations.
 float triangulation(float &x, float &y,
                     float alpha1, float alpha2, float alpha3,
                     float x1, float y1, float x2, float y2, float x3, float y3)
@@ -109,6 +109,65 @@ float triangulation(float &x, float &y,
     return invD; /* return 1/D */
 }
 
+// send robot odometry [x, y, yaw] through I2C
+byte data[sizeof(float) * 3];
+inline void sendOdometry(float x, float y, float yaw)
+{
+    memcpy(&data[0], &x, sizeof(x));
+    memcpy(&data[sizeof(x)], &y, sizeof(y));
+    memcpy(&data[sizeof(x) + sizeof(y)], &yaw, sizeof(yaw));
+
+    Wire.beginTransmission(10); // TBD
+    Wire.write(data, sizeof(data));
+    Wire.endTransmission();
+}
+
+bool pwm_high = true;               ///< indicates if pwm should be HIGH or LOW for this half of cycle
+int16_t crtFreq = freqHigh;         ///< current frequency (lowers in time -> motor accelerates)
+const short rotationSteps = 400;    ///< how many steps means a complete rotation
+bool rotationDone = false;
+ISR(TIMER1_COMPA_vect)
+{
+    // no need to deactivate/activate global interrupts?
+    // all interrupts are not "heavy" on computation
+
+    // writes current pwm level
+    digitalWrite(stepPin, pwm_high);
+    // pwm toggle
+    pwm_high = !pwm_high;
+
+    // count steps
+    // assumption: true = 1, false = 0
+    stepVal += pwm_high;
+    if (stepVal == rotationSteps)
+    {
+        // reset measured angles
+        anglesCount = 0;
+        angles[0] = 0.f;
+        angles[1] = 0.f;
+        angles[2] = 0.f;
+
+        rotationDone = true;
+    }
+    
+    // reset steps
+    stepVal = stepVal % rotationSteps;
+
+    // lower frequency -> increase motor speed
+    // each cycle, until lower bound frequency, decrease current frequency
+    if ((crtFreq > freqLow) && pwm_high)
+    {
+        --crtFreq;
+        OCR1A = crtFreq;
+    }
+}
+
+volatile bool mpuInterrupt = false;     ///< indicates whether MPU interrupt pin has gone high
+void mpuInterruptFcn()
+{
+    mpuInterrupt = true;
+}
+
 void laserInterrupt()
 {
     // determine which was the last measured angle
@@ -126,100 +185,137 @@ void laserInterrupt()
 
 void setup()
 {
+#ifdef _DEBUG_MSG
+    // serial
+    Serial.begin(115200);
+#endif
+
     // set driver pins mode
     pinMode(stepPin, OUTPUT); 
     pinMode(dirPin, OUTPUT);
 
     // set motor direction
-    digitalWrite(dirPin, HIGH);
+    digitalWrite(dirPin, LOW);
 
-    // enable interrupt
+    // laser interrupt
     pinMode(laserInterruptPin, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(laserInterruptPin), laserInterrupt, FALLING);
 
-    // serial
-    Serial.begin(115200);
-
     Wire.begin();
-    gyro.initialize(2000);
-    delay(1500); // wait for sensor to be ready
+    TWBR = 24; // 400kHz i2c clock
+    
+    mpu.initialize();
+    if (mpu.testConnection())
+    {
+        devStatus = mpu.dmpInitialize();
+
+        mpu.setZGyroOffset(0); // TBD
+        mpu.setZAccelOffset(0); // TBD
+
+        if (devStatus == 0)
+        {
+            mpu.setDMPEnabled(true);
+
+            attachInterrupt(digitalPinToInterrupt(mpuInterruptPin), mpuInterruptFcn, RISING);
+            mpuIntStatus = mpu.getIntStatus();
+
+            packetSize = mpu.dmpGetFIFOPacketSize();
+
+            dmpReady = true;
+#ifdef _DEBUG_MSG
+            Serial.println("MPU Ready!");
+#endif
+        }
+        else
+        {
+            // TODO: Report problem!
+#ifdef _DEBUG_MSG
+            Serial.println("devStatus != 0");
+#endif
+        }
+    }
+    else
+    {
+        // TODO: Report problem!
+#ifdef _DEBUG_MSG
+        Serial.println("!mpu.testConnection()");
+#endif
+    }
+
+    // setup motor timer
+    TCCR1A = 0; // no flags needed here
+    TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10); // CTC & 64 prescaler
+    OCR1A = freqHigh; // start with interrupt @ ~3.5ms
+    TIMSK1 |= (1 << OCIE1A);
+    sei(); // global interrupts
 }
 
 void loop()
 {
-    // make motor rotate: 400 = 360 deg
-    // skip last 4 steps, and do them while making calculations to avoid motor being stuck
-    for(stepVal = 0; stepVal < 395; ++stepVal)
+    // if gyroscope is ready, read it
+    if (mpuInterrupt || (fifoCount >= packetSize))
     {
-        digitalWrite(stepPin, HIGH);
-        delayMicroseconds(motorDelay);
-        digitalWrite(stepPin, LOW);
-        delayMicroseconds(motorDelay);
-        
-        if (motorDelay > minDelayMotor)
-        {
-            // accelerate
-            motorDelay -= accMotor;
-        }
+        mpuInterrupt = false;
+        mpuIntStatus = mpu.getIntStatus();
+
+        fifoCount = mpu.getFIFOCount();
+
+         if ((mpuIntStatus & 0x10) || fifoCount == 1024)
+         {
+#ifdef _DEBUG_MSG
+            Serial.println("OVERFLOW");
+#endif
+            mpu.resetFIFO();
+         }
+         else if (mpuIntStatus & 0x02)
+         {
+            while (fifoCount < packetSize)
+            {
+                fifoCount = mpu.getFIFOCount();
+            }
+
+            mpu.getFIFOBytes(fifoBuffer, packetSize);
+            fifoCount -= packetSize;
+
+            mpu.dmpGetQuaternion(&q, fifoBuffer);
+            mpu.dmpGetGravity(&gravity, &q);
+            mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+
+            yaw = ypr[0] * RAD2DEG; // cast to int16_t
+            yaw = (360 + yaw) % 360; // map to [0; 360)
+            
+#ifdef _DEBUG_MSG
+            //Serial.println(ypr[0] * RAD2DEG);
+#endif
+         }
     }
-    
-    unsigned long lastCommandTime = micros();
-    doOneStep(stepPin, motorDelay, lastCommandTime, stepVal);
-    
-    const unsigned long now = micros();
-    const unsigned long dt = (now - lastCycleTime);
-    lastCycleTime = now;
-
-    // update yaw
-    const float z = gyro.getY() * 0.07f * dt / 1000000.f;
-    yaw = yaw - z - 0.2f;
-
-    doOneStep(stepPin, motorDelay, lastCommandTime, stepVal);
 
     // if enough angles were measured, do triangulation
-    if (anglesCount == 3)
+    if (rotationDone && (anglesCount == 3))
     {
-        // compensate angles with current yaw
-        for (byte i = 0; i < anglesCount; ++i)
-        {
-            //angles[i] += yaw;
-        }
-
-        doOneStep(stepPin, motorDelay, lastCommandTime, stepVal);
-
-        const byte fb = (yaw < 90.f) ? 0 : (yaw < 180.f) ? 1 : 2;
+        // compute the order of beacons that were seen
+        const byte fb = (ypr[0] < 90.f) ? 0 : (ypr[0] < 180.f) ? 1 : 2;
         const byte sb = (fb + 1) % MAX_BEACONS;
         const byte tb = (fb + 2) % MAX_BEACONS;
 
         // calculate x and y of the robot
-        float x = 0.f, y = 0.f;
         const float err = triangulation(x, y,
                                         angles[0] * DEG2RAD, angles[1] * DEG2RAD, angles[2] * DEG2RAD,
                                         beaconsLoc[fb].x, beaconsLoc[fb].y,
                                         beaconsLoc[sb].x, beaconsLoc[sb].y,
                                         beaconsLoc[tb].x, beaconsLoc[tb].y);
-
-        doOneStep(stepPin, motorDelay, lastCommandTime, stepVal);
-
+        
+        // send odometry if everything is ok
         if (err > 0.f)
         {
-            Serial.println(String(x) + comma + String(y) + comma + String(yaw));
+            sendOdometry(x, y, ypr[0]);
+#ifdef _DEBUG_MSG
+            Serial.print(x);
+            Serial.print(",");
+            Serial.println(y);
+#endif
         }
 
-        doOneStep(stepPin, motorDelay, lastCommandTime, stepVal);
+        rotationDone = false;
     }
-
-    for (; stepVal < 400; ++stepVal)
-    {
-        digitalWrite(stepPin, HIGH);
-        delayMicroseconds(motorDelay);
-        digitalWrite(stepPin, LOW);
-        delayMicroseconds(motorDelay);
-    }
-
-    // reset measured angles
-    anglesCount = 0;
-    angles[0] = 0.f;
-    angles[1] = 0.f;
-    angles[2] = 0.f;
 }
