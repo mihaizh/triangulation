@@ -4,7 +4,7 @@
 #include <math.h>
 #include <stdint.h>
 
-#define _DEBUG_MSG
+//#define _DEBUG_MSG
 
 const float CTG_MAX = 100000000.f;
 const float CTG_MIN = -CTG_MAX;
@@ -22,33 +22,36 @@ inline float ctg(float value)
     return 1.f / tan(value);
 }
 
+template <typename _Ty>
 struct point
 {
-    int16_t x;
-    int16_t y;
+    _Ty x;
+    _Ty y;
 };
 
-const byte MAX_BEACONS = 3;             ///< beacons on scene
-const point beaconsLoc[MAX_BEACONS] = { ///< beacons locations
-    { 60, 175 },
-    { 180, 0 },
-    { 0, 0 }
+const byte MAX_BEACONS = 3; ///< beacons on scene
+const point<float> beaconsLoc[MAX_BEACONS] = { ///< beacons locations
+    { 303.3f, 4.0f },
+    { 304.0f, 196.f },
+    { -3.3f, 98.f }
 };
 
 const byte stepPin = 4; ///< pin number for step
-const byte dirPin = 5;  ///< pin number for direction
+const byte dirPin = 5; ///< pin number for direction
 
-const byte laserInterruptPin = 2;   ///< pin number for laser interrupt
-const byte mpuInterruptPin = 3;     ///< pin number for mpu interrupt
+const byte laserInterruptPin = 2; ///< pin number for laser interrupt
+const byte mpuInterruptPin = 3; ///< pin number for mpu interrupt
 
-int16_t stepVal = 0;          ///< current step of motor
+int16_t stepVal = 0; ///< current step of motor
+const float STEP2DEG = 0.9f; ///< convert from steps to degrees
+const float DEG2STEP = 1.f / STEP2DEG; ///< convert from degrees to steps
 
 const int16_t freqHigh = 877; ///< ~3.5ms
-const int16_t freqLow = 150;  ///< ~0.6ms
+const int16_t freqLow = 150; ///< ~0.6ms
 
-const byte MAX_ANGLES = 3;                      ///< maximum measureable angles
-float angles[MAX_ANGLES] = { 0.F, 0.F, 0.F };   ///< measured angles
-byte anglesCount = 0;                           ///< number of measured angles
+const byte MAX_ANGLES = 3; ///< maximum measureable angles
+float angles[MAX_ANGLES] = { 0.F, 0.F, 0.F }; ///< measured angles
+byte anglesCount = 0; ///< number of measured angles
 
 MPU6050 mpu;
 
@@ -59,12 +62,15 @@ uint16_t packetSize;    ///< expected DMP packet size (default is 42 bytes)
 uint16_t fifoCount;     ///< count of all bytes currently in FIFO
 uint8_t fifoBuffer[64]; ///< FIFO storage buffer
 float ypr[3];           ///< [yaw, pitch, roll]
+float ypr_offset[3];    ///< [yaw, pitch, roll]
 Quaternion q;           // [w, x, y, z]         quaternion container
 VectorFloat gravity;    // [x, y, z]            gravity vector
+
 int16_t yaw = 0;
 
-float x = 0.f;
-float y = 0.f;
+bool initialized = false;
+
+point<float> location = { 0.f, 0.f };
 
 // Estimates robot position based on measured angles to each beacon
 // and beacon locations.
@@ -109,23 +115,50 @@ float triangulation(float &x, float &y,
     return invD; /* return 1/D */
 }
 
-// send robot odometry [x, y, yaw] through I2C
-byte data[sizeof(float) * 3];
-inline void sendOdometry(float x, float y, float yaw)
+// send robot odometry [x, y, yaw] through Serial
+inline void sendOdometry()
 {
-    memcpy(&data[0], &x, sizeof(x));
-    memcpy(&data[sizeof(x)], &y, sizeof(y));
-    memcpy(&data[sizeof(x) + sizeof(y)], &yaw, sizeof(yaw));
-
-    Wire.beginTransmission(10); // TBD
-    Wire.write(data, sizeof(data));
-    Wire.endTransmission();
+    byte data[(sizeof(float) * 2) + sizeof(int16_t)];
+    if (initialized)
+    {
+        memcpy(&data[0], &location.x, sizeof(location.x));
+        memcpy(&data[sizeof(location.x)], &location.y, sizeof(location.y));
+        memcpy(&data[sizeof(location.x) + sizeof(location.y)], &yaw, sizeof(yaw));
+    
+        Serial.write(data, sizeof(data));
+    }
+    else
+    {
+        memcpy(&data[0], &yaw, sizeof(yaw));
+        Serial.write(data, sizeof(yaw));
+    }
 }
 
-bool pwm_high = true;               ///< indicates if pwm should be HIGH or LOW for this half of cycle
-int16_t crtFreq = freqHigh;         ///< current frequency (lowers in time -> motor accelerates)
-const short rotationSteps = 400;    ///< how many steps means a complete rotation
-bool rotationDone = false;
+bool pwm_high = true;         ///< indicates if pwm should be HIGH or LOW for this half of cycle
+int16_t crtFreq = freqHigh;   ///< current frequency (lowers in time -> motor accelerates)
+short rotationSteps = 400;    ///< how many steps means a complete rotation
+float lastCorrectionYaw = 0.f;///< last yaw angle the correction was done
+bool rotationDone = false;    ///< indicates whether a complete rotation has been done
+
+inline int16_t getCorrectionYaw()
+{
+    int16_t correctionYaw = 0;
+    if ((yaw < 90) && (lastCorrectionYaw > 270)) // handle jump from 360 to 0
+    {
+        correctionYaw = 360 + yaw - lastCorrectionYaw;
+    }
+    else if ((yaw > 270) && (lastCorrectionYaw < 90)) // handle jump from 0 to 360
+    {
+        correctionYaw = -(360 - yaw + lastCorrectionYaw);
+    }
+    else
+    {
+        correctionYaw = yaw - lastCorrectionYaw; // no jump
+    }
+
+    return correctionYaw;
+}
+
 ISR(TIMER1_COMPA_vect)
 {
     // no need to deactivate/activate global interrupts?
@@ -141,17 +174,14 @@ ISR(TIMER1_COMPA_vect)
     stepVal += pwm_high;
     if (stepVal == rotationSteps)
     {
-        // reset measured angles
-        anglesCount = 0;
-        angles[0] = 0.f;
-        angles[1] = 0.f;
-        angles[2] = 0.f;
-
+        const int16_t correctionYaw = getCorrectionYaw();
+        
         rotationDone = true;
+        rotationSteps = 400 - (correctionYaw * DEG2STEP);
+        lastCorrectionYaw = yaw;
+
+        stepVal = 0;
     }
-    
-    // reset steps
-    stepVal = stepVal % rotationSteps;
 
     // lower frequency -> increase motor speed
     // each cycle, until lower bound frequency, decrease current frequency
@@ -168,12 +198,24 @@ void mpuInterruptFcn()
     mpuInterrupt = true;
 }
 
+void initialInterrupt()
+{
+    // set offsets
+    memcpy(&ypr_offset, &ypr, sizeof(ypr_offset));
+    // activate laser interrupt
+    attachInterrupt(digitalPinToInterrupt(laserInterruptPin), laserInterrupt, FALLING);
+    // activate PWM timer
+    TIMSK1 |= (1 << OCIE1A);
+    
+    initialized = true;
+}
+
 void laserInterrupt()
 {
     // determine which was the last measured angle
-    const byte lastAngleIndex = (anglesCount == 0) ? (MAX_ANGLES - 1) : (anglesCount - 1);
+    const byte lastAngleIndex = (anglesCount == 0) ? (MAX_ANGLES - 1) : ((anglesCount < 4) ? (anglesCount - 1) : 0);
     // calculate the current angle
-    const float angle = stepVal * 0.9f;
+    const float angle = stepVal * STEP2DEG;
     // validate measured angle
     if (abs(angle - angles[lastAngleIndex]) > 10.f)
     {
@@ -185,10 +227,7 @@ void laserInterrupt()
 
 void setup()
 {
-#ifdef _DEBUG_MSG
-    // serial
     Serial.begin(115200);
-#endif
 
     // set driver pins mode
     pinMode(stepPin, OUTPUT); 
@@ -199,7 +238,7 @@ void setup()
 
     // laser interrupt
     pinMode(laserInterruptPin, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(laserInterruptPin), laserInterrupt, FALLING);
+    attachInterrupt(digitalPinToInterrupt(laserInterruptPin), initialInterrupt, FALLING);
 
     Wire.begin();
     TWBR = 24; // 400kHz i2c clock
@@ -241,12 +280,11 @@ void setup()
         Serial.println("!mpu.testConnection()");
 #endif
     }
-
+    
     // setup motor timer
     TCCR1A = 0; // no flags needed here
     TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10); // CTC & 64 prescaler
     OCR1A = freqHigh; // start with interrupt @ ~3.5ms
-    TIMSK1 |= (1 << OCIE1A);
     sei(); // global interrupts
 }
 
@@ -281,41 +319,41 @@ void loop()
             mpu.dmpGetGravity(&gravity, &q);
             mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
 
-            yaw = ypr[0] * RAD2DEG; // cast to int16_t
-            yaw = (360 + yaw) % 360; // map to [0; 360)
-            
-#ifdef _DEBUG_MSG
-            //Serial.println(ypr[0] * RAD2DEG);
-#endif
+            yaw = (ypr[0] - ypr_offset[0]) * RAD2DEG; // implicit cast to int16_t
+            yaw = (360 - yaw) % 360; // map to [0; 360)
+
+            if (!initialized)
+            {
+                sendOdometry();
+            }
          }
     }
 
     // if enough angles were measured, do triangulation
     if (rotationDone && (anglesCount == 3))
     {
-        // compute the order of beacons that were seen
-        const byte fb = (ypr[0] < 90.f) ? 0 : (ypr[0] < 180.f) ? 1 : 2;
-        const byte sb = (fb + 1) % MAX_BEACONS;
-        const byte tb = (fb + 2) % MAX_BEACONS;
-
         // calculate x and y of the robot
-        const float err = triangulation(x, y,
+        const float err = triangulation(location.x, location.y,
                                         angles[0] * DEG2RAD, angles[1] * DEG2RAD, angles[2] * DEG2RAD,
-                                        beaconsLoc[fb].x, beaconsLoc[fb].y,
-                                        beaconsLoc[sb].x, beaconsLoc[sb].y,
-                                        beaconsLoc[tb].x, beaconsLoc[tb].y);
+                                        beaconsLoc[0].x, beaconsLoc[0].y,
+                                        beaconsLoc[1].x, beaconsLoc[1].y,
+                                        beaconsLoc[2].x, beaconsLoc[2].y);
         
         // send odometry if everything is ok
-        if (err > 0.f)
+        if (err > -0.99f)
         {
-            sendOdometry(x, y, ypr[0]);
-#ifdef _DEBUG_MSG
-            Serial.print(x);
-            Serial.print(",");
-            Serial.println(y);
-#endif
+            sendOdometry();
         }
+    }
 
+    if (rotationDone)
+    {
+        // reset measured angles
+        anglesCount = 0;
+        angles[0] = 0.f;
+        angles[1] = 0.f;
+        angles[2] = 0.f;
+        
         rotationDone = false;
     }
 }
