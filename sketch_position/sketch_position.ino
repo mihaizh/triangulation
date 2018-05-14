@@ -31,9 +31,9 @@ struct point
 
 const byte MAX_BEACONS = 3; ///< beacons on scene
 const point<float> beaconsLoc[MAX_BEACONS] = { ///< beacons locations
-    { 303.3f, 4.0f },
-    { 304.0f, 196.f },
-    { -3.3f, 98.f }
+    { 106.f, 60.f },
+    { 0.f, 88.f },
+    { 0.f, 0.f }
 };
 
 const byte stepPin = 4; ///< pin number for step
@@ -121,16 +121,20 @@ inline void sendOdometry()
     byte data[(sizeof(float) * 2) + sizeof(int16_t)];
     if (initialized)
     {
-        memcpy(&data[0], &location.x, sizeof(location.x));
+        /*memcpy(&data[0], &location.x, sizeof(location.x));
         memcpy(&data[sizeof(location.x)], &location.y, sizeof(location.y));
         memcpy(&data[sizeof(location.x) + sizeof(location.y)], &yaw, sizeof(yaw));
     
-        Serial.write(data, sizeof(data));
+        Serial.write(data, sizeof(data));*/
+        Serial.print(location.x);
+        Serial.print(",");
+        Serial.println(location.y);
     }
     else
     {
-        memcpy(&data[0], &yaw, sizeof(yaw));
-        Serial.write(data, sizeof(yaw));
+        /*memcpy(&data[0], &yaw, sizeof(yaw));
+        Serial.write(data, sizeof(yaw));*/
+        Serial.println(yaw);
     }
 }
 

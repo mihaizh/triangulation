@@ -58,4 +58,9 @@ lastCorrectionYaw = yaw;
 ```
 Here, 400 steps means a complete rotation (360 degrees). 0.9 is used to convert from degrees to steps. In the code, you will also see the handling of jumps from 360 degrees to 0 and from 0 to 360.
 
-The code also includes an initialization routine. This is done because the gyroscope must first correct itself. The MPU does this automatically, but in time. Usually it takes from 10 seconds to 1 minute. When you're reading the values from it, you will see that at some point it will be stable. That's when it corrected itself. When the interrupt takes place, the angle will be saved as offset and the *yaw* will be considered 0.
+## Gyroscope filtering
+The MPU6050 is known to have a drift. The MPU on it is able to filter it using the accelerometer, but it can't do it instantly. Until it reaches stability it may take some time. Also, the value will not go to 0, but it will reach stability at some degree. 
+
+An initialization routine exists such that it saves that angle as an offset angle, and the next measurements have this angle substracted. The first interrupt generated on the laser interrupt pin will execute this routine. You have to generate this manually when the value is stable by applying ground to the optocoupler anode.
+
+This interrupt will also start the stepper motor.
