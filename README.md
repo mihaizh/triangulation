@@ -64,3 +64,10 @@ The MPU6050 is known to have a drift. The MPU on it is able to filter it using t
 An initialization routine exists such that it saves that angle as an offset angle, and the next measurements have this angle substracted. The first interrupt generated on the laser interrupt pin will execute this routine. You have to generate this manually when the value is stable by applying ground to the optocoupler anode.
 
 This interrupt will also start the stepper motor.
+
+## TODO
+* The laser does not always reflect on the same point on beacon, so the actual locations may differ a bit. Find a way to fix this.
+    * **Hint 1**: Take also the FALLING angle and do the mean between them?
+    * **Hint 2**: Sum all the RISING and FALLING angles from a beacon and do the mean?
+* More tests. The correction of the robot rotation may fail sometimes.
+* Filter resulted positions from wrong angles (when the robot was rotating).
