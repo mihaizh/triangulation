@@ -31,8 +31,8 @@ struct point
 
 const byte MAX_BEACONS = 3; ///< beacons on scene
 const point<float> beaconsLoc[MAX_BEACONS] = { ///< beacons locations
-    { 106.f, 60.f },
-    { 0.f, 88.f },
+    { 230.f, 0.f },
+    { 0.f, 137.f },
     { 0.f, 0.f }
 };
 
@@ -115,27 +115,23 @@ float triangulation(float &x, float &y,
     return invD; /* return 1/D */
 }
 
+#pragma pack(push, 1)
+struct sPosition
+{
+    float x;
+    float y;
+    int16_t yaw;  
+};
+#pragma pack(pop)
+
 // send robot odometry [x, y, yaw] through Serial
 inline void sendOdometry()
 {
-    byte data[(sizeof(float) * 2) + sizeof(int16_t)];
-    if (initialized)
-    {
-        /*memcpy(&data[0], &location.x, sizeof(location.x));
-        memcpy(&data[sizeof(location.x)], &location.y, sizeof(location.y));
-        memcpy(&data[sizeof(location.x) + sizeof(location.y)], &yaw, sizeof(yaw));
-    
-        Serial.write(data, sizeof(data));*/
-        Serial.print(location.x);
-        Serial.print(",");
-        Serial.println(location.y);
-    }
-    else
-    {
-        /*memcpy(&data[0], &yaw, sizeof(yaw));
-        Serial.write(data, sizeof(yaw));*/
-        Serial.println(yaw);
-    }
+    sPosition pos;
+    pos.x = location.x;
+    pos.y = location.y;
+    pos.yaw = yaw;
+    Serial.write(reinterpret_cast<char *>(&pos), sizeof(pos));
 }
 
 bool pwm_high = true;         ///< indicates if pwm should be HIGH or LOW for this half of cycle
